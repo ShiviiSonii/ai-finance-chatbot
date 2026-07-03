@@ -20,6 +20,8 @@ const schemaDescription = {
   invoices: {
     invoiceId: "string",
     poId: "string",
+    customerId: "string (derived from purchaseOrders by poId)",
+    customerName: "string (derived from purchaseOrders by poId)",
     amount: "number",
     currency: "string",
     dueDate: "string",
@@ -167,6 +169,17 @@ function aggregateAlias(aggregate: NonNullable<QuerySpec["aggregate"]>): string 
   return `${aggregate.type}_${aggregate.field}`;
 }
 
+function currencyFromRows(rows: QueryRow[]): string | null {
+  const currencies = new Set(
+    rows
+      .map((row) => row.currency)
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  );
+  if (currencies.size === 0) return null;
+  if (currencies.size === 1) return [...currencies][0]!;
+  return "Mixed";
+}
+
 function applyAggregate(rows: QueryRow[], spec: QuerySpec): QueryRow[] {
   if (spec.aggregate === null) return rows;
 
@@ -189,11 +202,23 @@ function applyAggregate(rows: QueryRow[], spec: QuerySpec): QueryRow[] {
     groups.set(key, existing);
   }
 
-  return [...groups.values()].map((group) => ({
-    [spec.groupBy!]: group.value,
-    [alias]: aggregateRows(group.rows, spec.aggregate!),
-    rowCount: group.rows.length,
-  }));
+  return [...groups.values()].map((group) => {
+    const result: QueryRow = {
+      [spec.groupBy!]: group.value,
+      [alias]: aggregateRows(group.rows, spec.aggregate!),
+      rowCount: group.rows.length,
+    };
+
+    // Surface a deterministic currency for grouped totals when possible.
+    if (spec.groupBy !== "currency") {
+      const currency = currencyFromRows(group.rows);
+      if (currency !== null) {
+        result.currency = currency;
+      }
+    }
+
+    return result;
+  });
 }
 
 async function readRows(
@@ -205,7 +230,18 @@ async function readRows(
   }
 
   if (table === "invoices") {
-    return (await ctx.db.query("invoices").take(MAX_ROWS)).map(toQueryRow);
+    const invoices = await ctx.db.query("invoices").take(MAX_ROWS);
+    const purchaseOrders = await ctx.db.query("purchaseOrders").take(MAX_ROWS);
+    const purchaseOrdersById = new Map(purchaseOrders.map((po) => [po.poId, po]));
+
+    return invoices.map((invoice) => {
+      const purchaseOrder = purchaseOrdersById.get(invoice.poId);
+      return toQueryRow({
+        ...invoice,
+        customerId: purchaseOrder?.customerId ?? null,
+        customerName: purchaseOrder?.customerName ?? null,
+      });
+    });
   }
 
   const payments = await ctx.db.query("payments").take(MAX_ROWS);

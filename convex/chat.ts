@@ -10,6 +10,11 @@ const MAX_COLUMNS = 6;
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_HISTORY_CHARS = 600;
 
+const OFF_TOPIC_RESPONSE =
+  "I'm a finance data assistant and can only answer questions about purchase orders, invoices, and payments in your dataset. Try asking about customers, amounts, overdue invoices, or payment history.";
+const GREETING_RESPONSE =
+  "Hi! I can help with your finance data. Ask me about purchase orders, invoices, payments, overdue invoices, or top customers.";
+
 const historyMessageValidator = v.object({
   role: v.union(v.literal("user"), v.literal("assistant")),
   content: v.string(),
@@ -57,6 +62,81 @@ function formatConversationContext(
   return `Conversation so far:\n${transcript}\n\nLatest user question: ${message}`;
 }
 
+function isGreetingOnlyMessage(message: string): boolean {
+  const normalized = message
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+
+  const greetingTokens = new Set([
+    "hi",
+    "hii",
+    "hiii",
+    "hello",
+    "hey",
+    "heyy",
+    "yo",
+    "sup",
+    "hola",
+    "namaste",
+  ]);
+
+  const politeTokens = new Set([
+    "dear",
+    "buddy",
+    "sir",
+    "madam",
+    "team",
+    "there",
+    "bot",
+    "assistant",
+    "please",
+  ]);
+
+  const tokens = normalized.split(" ");
+  const greetingCount = tokens.filter((token) => greetingTokens.has(token)).length;
+  if (greetingCount === 0) return false;
+
+  // Treat short greeting phrases like "hello dear" as greetings.
+  if (tokens.length <= 4 && tokens.every((token) => greetingTokens.has(token) || politeTokens.has(token))) {
+    return true;
+  }
+
+  return tokens.every((token) => greetingTokens.has(token));
+}
+
+function isClearlyFinanceQuestion(message: string): boolean {
+  const normalized = message
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return false;
+
+  const financeTerms = [
+    "purchase order",
+    "purchase orders",
+    "po",
+    "invoice",
+    "invoices",
+    "payment",
+    "payments",
+    "customer",
+    "customers",
+    "overdue",
+    "unpaid",
+    "paid",
+    "amount",
+    "currency",
+    "due date",
+    "late payment",
+  ];
+
+  return financeTerms.some((term) => normalized.includes(term));
+}
+
 function buildPlanningPrompt(
   conversationContext: string,
   schema: unknown,
@@ -94,6 +174,60 @@ Rules:
 - For "total invoiced" questions, use the invoices table and sum amount.
 
 ${conversationContext}${retryInstruction}`;
+}
+
+function buildTopicClassificationPrompt(conversationContext: string): string {
+  return `You classify whether a user message can be answered using finance business data.
+
+Available data: purchase orders, invoices, and payments (customer names, amounts, currencies, dates, payment status, overdue and late payment flags).
+
+${conversationContext}
+
+Reply with ONLY valid JSON:
+{ "onTopic": true }  — if the message asks about this finance data, or is a follow-up to a prior finance answer in the conversation
+{ "onTopic": false } — if the message is unrelated (weather, jokes, general knowledge, coding help, chit-chat, etc.)
+
+Rules:
+- Short follow-ups after finance questions (for example "and the second one?" or "what about Acme?") are on-topic.
+- Greetings alone (for example "hi" or "hello") are off-topic.
+- Respond with ONLY the JSON object. Do not include prose or markdown fences.`;
+}
+
+function parseTopicClassification(text: string): boolean {
+  const parsed = JSON.parse(text.trim()) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Top-level value must be a JSON object.");
+  }
+
+  const raw = parsed as Record<string, unknown>;
+  if (typeof raw.onTopic !== "boolean") {
+    throw new Error('Classification must include a boolean "onTopic" field.');
+  }
+
+  return raw.onTopic;
+}
+
+async function isMessageOnTopic(conversationContext: string): Promise<boolean> {
+  try {
+    const { response } = await generateWithFallback(
+      {
+        messages: [
+          {
+            role: "user",
+            content: buildTopicClassificationPrompt(conversationContext),
+          },
+        ],
+      },
+      "topic classification",
+    );
+
+    return parseTopicClassification(response.text ?? "");
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      throw error;
+    }
+    return true;
+  }
 }
 
 async function planStructuredQuery(
@@ -140,6 +274,11 @@ function formatScalar(value: unknown): string {
 }
 
 function pickColumns(rows: Record<string, unknown>[]): string[] {
+  const hiddenColumns = new Set([
+    "rowCount",
+    "matchedRowCount",
+    "spec",
+  ]);
   const preferredOrder = [
     "id",
     "poId",
@@ -159,7 +298,11 @@ function pickColumns(rows: Record<string, unknown>[]): string[] {
     "paymentDelayDays",
     "isLate",
   ];
-  const present = new Set(rows.flatMap((row) => Object.keys(row)));
+  const present = new Set(
+    rows
+      .flatMap((row) => Object.keys(row))
+      .filter((col) => !hiddenColumns.has(col)),
+  );
   const preferred = preferredOrder.filter((col) => present.has(col));
   const remainder = [...present].filter((col) => !preferred.includes(col)).sort();
   return [...preferred, ...remainder].slice(0, MAX_COLUMNS);
@@ -264,11 +407,21 @@ export const ask = action({
   },
   handler: async (ctx, args) => {
     const history = trimHistory(args.history ?? []);
+    if (isGreetingOnlyMessage(args.message)) {
+      return GREETING_RESPONSE;
+    }
+
     const conversationContext = formatConversationContext(history, args.message);
+    const skipTopicCheck = isClearlyFinanceQuestion(args.message);
     const toolRuns: ToolRun[] = [];
     let assistantText = "";
 
     try {
+      const onTopic = skipTopicCheck ? true : await isMessageOnTopic(conversationContext);
+      if (!onTopic) {
+        return OFF_TOPIC_RESPONSE;
+      }
+
       const spec = await planStructuredQuery(ctx, conversationContext);
 
       const data = await ctx.runQuery(internal.financeData.runStructuredQuery, {
@@ -287,7 +440,8 @@ export const ask = action({
             messages: [
               {
                 role: "user",
-                content: `You are a finance assistant. Answer in 1-2 sentences using ONLY the query result. Tables are rendered automatically, so summarize rather than listing every row.
+                  content: `You are a finance assistant. Answer in 1-2 sentences using ONLY the query result. Tables are rendered automatically, so summarize rather than listing every row.
+Never infer or assume currency from symbols (for example "$"). Only mention currency when a currency field is explicitly present in the returned data.
 
 ${conversationContext}
 

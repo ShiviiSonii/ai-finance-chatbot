@@ -11,7 +11,6 @@
 import type * as chat from "../chat.js";
 import type * as financeData from "../financeData.js";
 import type * as groq from "../groq.js";
-import type * as queries from "../queries.js";
 import type * as querySpec from "../querySpec.js";
 
 import type {
@@ -24,7 +23,6 @@ declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   financeData: typeof financeData;
   groq: typeof groq;
-  queries: typeof queries;
   querySpec: typeof querySpec;
 }>;
 
