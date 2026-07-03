@@ -172,6 +172,7 @@ Rules:
 - For overdue invoices, filter invoices where status equals "Unpaid" and dueDate is less than today's date.
 - For delayed or late payments, query payments where isLate equals true; group by customerName and count paymentId when the user asks which customers are frequent.
 - For "total invoiced" questions, use the invoices table and sum amount.
+- For purchase orders that are fully invoiced, partially invoiced, or not invoiced, query purchaseOrders and filter invoiceCoverageStatus with "Fully Invoiced", "Partially Invoiced", or "Not Invoiced".
 
 ${conversationContext}${retryInstruction}`;
 }
@@ -273,18 +274,37 @@ function formatScalar(value: unknown): string {
   return JSON.stringify(value).replaceAll("|", "\\|");
 }
 
-function pickColumns(rows: Record<string, unknown>[]): string[] {
+function orderedUnique(items: string[]): string[] {
+  return [...new Set(items)];
+}
+
+function relevantSpecFields(spec: QuerySpec): string[] {
+  return orderedUnique([
+    ...spec.filters.map((filter) => filter.field),
+    ...(spec.groupBy === null ? [] : [spec.groupBy]),
+    ...(spec.aggregate === null ? [] : [spec.aggregate.field, `${spec.aggregate.type}_${spec.aggregate.field}`]),
+    ...(spec.sort === null ? [] : [spec.sort.field]),
+  ]);
+}
+
+function pickColumns(rows: Record<string, unknown>[], spec: QuerySpec): string[] {
   const hiddenColumns = new Set([
     "rowCount",
     "matchedRowCount",
     "spec",
   ]);
+  const relevantFields = relevantSpecFields(spec);
+  const coverageColumns = relevantFields.includes("invoiceCoverageStatus")
+    ? ["invoiceCoverageStatus", "amount", "invoicedAmount", "remainingToInvoice", "invoiceCount"]
+    : [];
   const preferredOrder = [
     "id",
     "poId",
     "invoiceId",
     "paymentId",
     "customerName",
+    ...coverageColumns,
+    ...relevantFields,
     "customerId",
     "amount",
     "sum_amount",
@@ -297,20 +317,24 @@ function pickColumns(rows: Record<string, unknown>[]): string[] {
     "paymentDate",
     "paymentDelayDays",
     "isLate",
+    "invoicedAmount",
+    "remainingToInvoice",
+    "invoiceCount",
+    "invoiceCoverageStatus",
   ];
   const present = new Set(
     rows
       .flatMap((row) => Object.keys(row))
       .filter((col) => !hiddenColumns.has(col)),
   );
-  const preferred = preferredOrder.filter((col) => present.has(col));
+  const preferred = orderedUnique(preferredOrder).filter((col) => present.has(col));
   const remainder = [...present].filter((col) => !preferred.includes(col)).sort();
   return [...preferred, ...remainder].slice(0, MAX_COLUMNS);
 }
 
-function renderTable(rows: Record<string, unknown>[]): string {
+function renderTable(rows: Record<string, unknown>[], spec: QuerySpec): string {
   if (rows.length < 2) return "";
-  const columns = pickColumns(rows);
+  const columns = pickColumns(rows, spec);
   const header = `| ${columns.join(" | ")} |`;
   const separator = `| ${columns.map(() => "---").join(" | ")} |`;
   const body = rows
@@ -356,7 +380,7 @@ function renderTablesInCode(toolRuns: ToolRun[]): string {
     const rows = extractTableRows(run.data);
     if (!rows) continue;
 
-    const table = renderTable(rows);
+    const table = renderTable(rows, run.args);
     if (table) sections.push(table);
   }
   return sections.join("\n\n");

@@ -16,6 +16,10 @@ const schemaDescription = {
     amount: "number",
     currency: "string",
     orderDate: "string",
+    invoicedAmount: "number (derived from invoices by poId)",
+    remainingToInvoice: "number (purchase order amount minus invoicedAmount)",
+    invoiceCount: "number (derived from invoices by poId)",
+    invoiceCoverageStatus: "'Fully Invoiced' | 'Partially Invoiced' | 'Not Invoiced' (derived from invoice totals by poId)",
   },
   invoices: {
     invoiceId: "string",
@@ -180,6 +184,15 @@ function currencyFromRows(rows: QueryRow[]): string | null {
   return "Mixed";
 }
 
+function invoiceCoverageStatus(
+  poAmount: number,
+  invoicedAmount: number,
+): "Fully Invoiced" | "Partially Invoiced" | "Not Invoiced" {
+  if (invoicedAmount >= poAmount) return "Fully Invoiced";
+  if (invoicedAmount > 0) return "Partially Invoiced";
+  return "Not Invoiced";
+}
+
 function applyAggregate(rows: QueryRow[], spec: QuerySpec): QueryRow[] {
   if (spec.aggregate === null) return rows;
 
@@ -226,7 +239,32 @@ async function readRows(
   table: TableName,
 ): Promise<QueryRow[]> {
   if (table === "purchaseOrders") {
-    return (await ctx.db.query("purchaseOrders").take(MAX_ROWS)).map(toQueryRow);
+    const purchaseOrders = await ctx.db.query("purchaseOrders").take(MAX_ROWS);
+    const invoices = await ctx.db.query("invoices").take(MAX_ROWS);
+    const invoiceSummariesByPoId = new Map<string, { amount: number; count: number }>();
+
+    for (const invoice of invoices) {
+      const existing = invoiceSummariesByPoId.get(invoice.poId) ?? { amount: 0, count: 0 };
+      existing.amount += invoice.amount;
+      existing.count += 1;
+      invoiceSummariesByPoId.set(invoice.poId, existing);
+    }
+
+    return purchaseOrders.map((purchaseOrder) => {
+      const invoiceSummary = invoiceSummariesByPoId.get(purchaseOrder.poId) ?? {
+        amount: 0,
+        count: 0,
+      };
+      const remainingToInvoice = Math.max(0, purchaseOrder.amount - invoiceSummary.amount);
+
+      return toQueryRow({
+        ...purchaseOrder,
+        invoicedAmount: invoiceSummary.amount,
+        remainingToInvoice,
+        invoiceCount: invoiceSummary.count,
+        invoiceCoverageStatus: invoiceCoverageStatus(purchaseOrder.amount, invoiceSummary.amount),
+      });
+    });
   }
 
   if (table === "invoices") {
